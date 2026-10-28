@@ -26,6 +26,17 @@
     </form>
   </section>
 
+  <!-- Waiting for admin approval -->
+  <section id="pending-view" class="auth" hidden>
+    <div class="auth-card">
+      <div class="brand big"><span class="logo">LF</span><div><b>LogiFlow</b><small>WMS + TMS</small></div></div>
+      <h2>รอผู้ดูแลระบบอนุมัติ</h2>
+      <p class="muted">บัญชี <b id="pending-email"></b> สมัครเรียบร้อยแล้ว กรุณาแจ้งผู้ดูแลระบบให้กำหนดสิทธิ์การใช้งาน แล้วกดตรวจสอบอีกครั้ง</p>
+      <button class="btn primary block" id="pending-retry">ตรวจสอบอีกครั้ง</button>
+      <button class="btn ghost block" id="pending-logout">ออกจากระบบ</button>
+    </div>
+  </section>
+
   <!-- App -->
   <div id="app-view" class="layout" hidden>
     <aside class="sidebar" id="sidebar">
@@ -33,6 +44,7 @@
       <nav id="nav"></nav>
       <div class="sidebar-foot">
         <span class="muted small" id="user-email"></span>
+        <span class="badge b-pri" id="user-role"></span>
         <button class="btn ghost sm" id="logout">ออกจากระบบ</button>
       </div>
     </aside>
@@ -41,6 +53,8 @@
         <button class="btn ghost sm menu-btn" id="menu-btn" aria-label="เมนู">☰</button>
         <h1 id="page-title">-</h1>
         <div class="topbar-actions" id="page-actions"></div>
+        <button class="btn ghost bell" id="bell" title="การแจ้งเตือน" hidden>🔔<span class="bell-count" id="bell-count" hidden></span></button>
+        <span class="live-dot" id="live-dot" title="Realtime"></span>
       </header>
       <div id="page" class="page"></div>
     </main>
@@ -53,6 +67,16 @@
       <footer id="modal-foot"></footer>
     </form>
   </dialog>
+  <dialog id="scan-dialog" class="scan">
+    <form id="scan-form">
+      <header><h2 id="scan-title">สแกนบาร์โค้ด</h2><button type="button" class="btn ghost sm" onclick="this.closest('dialog').close()" aria-label="ปิด">✕</button></header>
+      <div class="modal-body">
+        <div id="scan-reader"></div>
+        <p class="small muted" id="scan-msg"></p>
+        <div class="row" style="flex-wrap:nowrap"><input id="scan-manual" placeholder="พิมพ์ / ยิงบาร์โค้ด แล้วกด Enter" autocomplete="off"><button class="btn primary">ตกลง</button></div>
+      </div>
+    </form>
+  </dialog>
   <div id="toasts"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
@@ -61,6 +85,7 @@
   <script src="js/core.js"></script>
   <script src="js/wms.js"></script>
   <script src="js/tms.js"></script>
+  <script src="js/features.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

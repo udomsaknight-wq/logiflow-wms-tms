@@ -19,7 +19,7 @@ function initLinesEditor(body) {
   const add = () => {
     const d = document.createElement('div');
     d.className = 'line';
-    d.innerHTML = `<select required><option value="">เลือกสินค้า</option>${optionTags(optProducts())}</select>
+    d.innerHTML = `<select required><option value="">เลือกสินค้า</option>${optionTags(optProducts())}</select>${scanBtn('product')}
       <input type="number" min="0.01" step="any" placeholder="จำนวน" required>
       <button type="button" class="btn sm ghost" title="ลบรายการ">✕</button>`;
     d.querySelector('button').onclick = () => d.remove();
@@ -85,21 +85,23 @@ Pages.dashboard = {
 /* ================= INVENTORY ================= */
 Pages.inventory = {
   title: 'สต็อกสินค้า', group: 'WMS คลังสินค้า', icon: '▦',
-  render: async (el, actions) => {
+  render: async (el, actions, params) => {
     await loadLookups('warehouses', 'locations', 'products');
-    let rows = [], summary = [], view = 'loc';
-    actions.innerHTML = `<button class="btn primary" data-act="adjustNew">± ปรับสต็อก</button>`;
+    let rows = [], summary = [], view = 'loc', shown = [];
+    const writable = can('warehouse');
+    actions.innerHTML = `<button class="btn" data-act="export">⇩ Excel</button>
+      ${writable ? '<button class="btn primary" data-act="adjustNew">± ปรับสต็อก</button>' : ''}`;
     el.innerHTML = `<div class="card flush">
       <div class="toolbar" style="padding:12px 16px">
         <div class="tabs" id="view"><button class="tab active" data-v="loc">ตาม Location / Lot</button><button class="tab" data-v="sku">สรุปตามสินค้า</button></div>
         <select id="wh"><option value="">ทุกคลัง</option>${optionTags(optWarehouses())}</select>
-        <input type="search" id="search" placeholder="ค้นหา SKU / ชื่อ / Location / Lot">
+        <input type="search" id="search" placeholder="ค้นหา SKU / ชื่อ / Location / Lot" value="${esc(params.get('q') || '')}">${scanBtn()}
         <span class="muted small" id="count"></span>
       </div><div id="tbl"></div></div>`;
 
     const load = async () => {
       [rows, summary] = await Promise.all([
-        q(sb.from('wt_inventory').select('*, product:wt_products(sku, name, uom), location:wt_locations(code, zone, warehouse_id)').gt('qty', 0)),
+        q(sb.from('wt_inventory').select('*, product:wt_products(sku, name, uom, barcode), location:wt_locations(code, zone, warehouse_id)').gt('qty', 0)),
         q(sb.from('wt_v_stock').select('*').order('sku')),
       ]);
       rows.sort((a, b) => a.product.sku.localeCompare(b.product.sku) || a.location.code.localeCompare(b.location.code));
@@ -111,6 +113,7 @@ Pages.inventory = {
       $('#wh', el).disabled = view === 'sku';
       if (view === 'sku') {
         const list = summary.filter(r => !term || `${r.sku} ${r.name}`.toLowerCase().includes(term));
+        shown = list.map(r => ({ sku: r.sku, name: r.name, uom: r.uom, on_hand: +r.on_hand, min_stock: +r.min_stock, below_min: r.below_min }));
         $('#count', el).textContent = `${list.length} SKU`;
         $('#tbl', el).innerHTML = tableHtml([
           { label: 'SKU', key: 'sku' }, { label: 'สินค้า', key: 'name' }, { label: 'หน่วย', key: 'uom' },
@@ -121,7 +124,9 @@ Pages.inventory = {
         return;
       }
       const list = rows.filter(r => (!wh || r.location.warehouse_id === wh) &&
-        (!term || `${r.product.sku} ${r.product.name} ${r.location.code} ${r.lot_no}`.toLowerCase().includes(term)));
+        (!term || `${r.product.sku} ${r.product.name} ${r.product.barcode || ''} ${r.location.code} ${r.lot_no}`.toLowerCase().includes(term)));
+      shown = list.map(r => ({ warehouse: byId('warehouses', r.location.warehouse_id)?.code, location: r.location.code, sku: r.product.sku,
+        name: r.product.name, lot_no: r.lot_no, expiry_date: r.expiry_date, qty: +r.qty, uom: r.product.uom }));
       $('#count', el).textContent = `${list.length} รายการ · รวม ${fmt(list.reduce((s, r) => s + Number(r.qty), 0))} หน่วย`;
       $('#tbl', el).innerHTML = tableHtml([
         { label: 'คลัง', render: r => esc(byId('warehouses', r.location.warehouse_id)?.code) },
@@ -130,8 +135,8 @@ Pages.inventory = {
         { label: 'Lot', key: 'lot_no' }, { label: 'วันหมดอายุ', render: r => expiryBadge(r.expiry_date) },
         { label: 'คงเหลือ', num: true, render: r => `<b>${fmt(r.qty)}</b> <span class="muted small">${esc(r.product.uom)}</span>` },
       ], list, {
-        actions: r => `<button class="btn sm" data-act="move" data-id="${r.id}">ย้าย</button>
-                       <button class="btn sm" data-act="adjust" data-id="${r.id}">ปรับ</button>`,
+        actions: writable ? r => `<button class="btn sm" data-act="move" data-id="${r.id}">ย้าย</button>
+                       <button class="btn sm" data-act="adjust" data-id="${r.id}">ปรับ</button>` : null,
         empty: 'ไม่มีสต็อก',
       });
     };
@@ -172,6 +177,7 @@ Pages.inventory = {
       });
     };
     const handlers = {
+      export: () => exportXlsx(`stock-${view}-${today()}`, shown),
       adjustNew: () => adjust(null),
       adjust: id => adjust(rows.find(r => r.id === Number(id))),
       move: id => {
@@ -203,7 +209,12 @@ Pages.inventory = {
 /* ================= MOVEMENTS ================= */
 Pages.movements = {
   title: 'ประวัติเคลื่อนไหว', group: 'WMS คลังสินค้า', icon: '⇄',
-  render: async el => {
+  render: async (el, actions) => {
+    let shown = [];
+    actions.innerHTML = '<button class="btn" data-act="export">⇩ Excel</button>';
+    bindActions(actions, { export: () => exportXlsx(`movements-${today()}`, shown.map(r => ({
+      time: r.created_at, type: r.move_type, sku: r.product?.sku, name: r.product?.name, from: r.from?.code, to: r.to?.code,
+      lot_no: r.lot_no, qty: +r.qty, ref_doc: r.ref_doc, note: r.note }))) });
     const rows = await q(sb.from('wt_stock_movements')
       .select('*, product:wt_products(sku, name), from:wt_locations!from_location_id(code), to:wt_locations!to_location_id(code)')
       .order('created_at', { ascending: false }).limit(500));
@@ -212,13 +223,14 @@ Pages.movements = {
       <input type="search" id="search" placeholder="ค้นหา SKU / เอกสาร"><span class="muted small">แสดง 500 รายการล่าสุด</span></div><div id="tbl"></div></div>`;
     const draw = () => {
       const t = $('#type', el).value, term = $('#search', el).value.trim().toLowerCase();
+      shown = rows.filter(r => (!t || r.move_type === t) && (!term || `${r.product?.sku} ${r.ref_doc}`.toLowerCase().includes(term)));
       $('#tbl', el).innerHTML = tableHtml([
         { label: 'เวลา', render: r => fdt(r.created_at) }, { label: 'ประเภท', render: r => badge(r.move_type) },
         { label: 'SKU', render: r => esc(r.product?.sku) }, { label: 'สินค้า', render: r => esc(r.product?.name) },
         { label: 'จาก', render: r => esc(r.from?.code) }, { label: 'ไป', render: r => esc(r.to?.code) },
         { label: 'Lot', key: 'lot_no' }, { label: 'จำนวน', num: true, render: r => fmt(r.qty) },
         { label: 'เอกสาร', key: 'ref_doc' }, { label: 'หมายเหตุ', key: 'note' },
-      ], rows.filter(r => (!t || r.move_type === t) && (!term || `${r.product?.sku} ${r.ref_doc}`.toLowerCase().includes(term))));
+      ], shown);
     };
     $('#type', el).onchange = draw;
     $('#search', el).oninput = draw;
@@ -232,7 +244,8 @@ Pages.inbound = {
   render: async (el, actions) => {
     await loadLookups('warehouses', 'locations', 'products', 'partners');
     let rows = [];
-    actions.innerHTML = `<button class="btn primary" data-act="new">+ สร้างใบรับสินค้า</button>`;
+    const writable = can('warehouse');
+    actions.innerHTML = writable ? `<button class="btn primary" data-act="new">+ สร้างใบรับสินค้า</button>` : '';
     el.innerHTML = `<div class="card flush"><div class="toolbar" style="padding:12px 16px">
       <select id="st"><option value="active">ค้างรับ</option><option value="">ทั้งหมด</option><option value="completed">เสร็จสิ้น</option><option value="cancelled">ยกเลิก</option></select>
       <input type="search" id="search" placeholder="ค้นหาเลขที่ / PO / ผู้ขาย"></div><div id="tbl"></div></div>`;
@@ -288,7 +301,7 @@ Pages.inbound = {
         .select('*, supplier:wt_partners(name), warehouse:wt_warehouses(code, name), lines:wt_inbound_lines(*, product:wt_products(sku, name, uom))')
         .eq('id', id).single());
       h.lines.sort((a, b) => a.id - b.id);
-      const editable = ['open', 'receiving'].includes(h.status);
+      const editable = writable && ['open', 'receiving'].includes(h.status);
       const locs = optLocations(h.warehouse_id);
       const defLoc = LK.locations.find(l => l.warehouse_id === h.warehouse_id && l.loc_type === 'receiving')?.id;
       openModal({
@@ -303,11 +316,12 @@ Pages.inbound = {
             { label: 'รับแล้ว', num: true, render: l => `<b style="color:${+l.qty_received >= +l.qty_expected ? 'var(--ok)' : 'inherit'}">${fmt(l.qty_received)}</b>` },
             ...(editable ? [{ label: 'รับเข้า (จำนวน / Location / Lot / หมดอายุ)', render: l => `<div class="row" data-line="${l.id}" style="flex-wrap:nowrap">
                 <input type="number" step="any" min="0" style="width:90px" value="${Math.max(0, l.qty_expected - l.qty_received)}" data-f="qty">
-                <select style="width:150px" data-f="loc">${optionTags(locs, defLoc)}</select>
+                <select style="width:150px" data-f="loc">${optionTags(locs, defLoc)}</select>${scanBtn('location')}
                 <input style="width:100px" placeholder="Lot" data-f="lot"><input type="date" style="width:140px" data-f="exp">
                 <button type="button" class="btn sm primary" data-act="recv" data-id="${l.id}">รับ</button></div>` }] : []),
           ], h.lines)}`,
-        footer: editable ? `<button type="button" class="btn danger" data-act="cancel">ยกเลิกเอกสาร</button>
+        footer: editable ? `<button type="button" class="btn" data-act="scanItem">▥ สแกนสินค้าที่มาถึง</button>
+          <button type="button" class="btn danger" data-act="cancel">ยกเลิกเอกสาร</button>
           <button type="button" class="btn ok" data-act="close">ปิดใบรับ (รับครบ)</button><span class="spacer"></span>` : '',
         onOpen: (body, foot) => {
           bindActions(body, {
@@ -326,6 +340,18 @@ Pages.inbound = {
             },
           });
           bindActions(foot, {
+            // scan a product barcode -> jump to its line
+            scanItem: async () => {
+              const code = await scanCode('สแกนสินค้าที่รับ');
+              if (!code) return;
+              const p = findProductByCode(code);
+              const line = p && h.lines.find(l => l.product_id === p.id);
+              if (!line) return toast(`สินค้า ${code} ไม่อยู่ในใบรับนี้`, 'err');
+              const box = body.querySelector(`[data-line="${line.id}"]`);
+              box.scrollIntoView({ block: 'center' });
+              box.querySelector('[data-f=qty]').select();
+              box.closest('tr').style.outline = '2px solid var(--primary)';
+            },
             close: async () => {
               if (!confirm('ปิดใบรับสินค้านี้?')) return;
               await q(sb.rpc('wt_close_inbound', { p_inbound_id: h.id }));
@@ -353,13 +379,16 @@ Pages.outbound = {
   title: 'ออเดอร์ขาออก (Outbound)', group: 'WMS คลังสินค้า', icon: '⤒',
   render: async (el, actions) => {
     await loadLookups('warehouses', 'products', 'partners');
-    let rows = [];
-    actions.innerHTML = `<button class="btn primary" data-act="new">+ สร้างออเดอร์</button>`;
+    let rows = [], shown = [];
+    const writable = can('warehouse');
+    actions.innerHTML = `<button class="btn" data-act="export">⇩ Excel</button>
+      ${writable ? `<button class="btn" data-act="import">⇧ นำเข้าออเดอร์</button>
+      <button class="btn primary" data-act="new">+ สร้างออเดอร์</button>` : ''}`;
     el.innerHTML = `<div class="card flush"><div class="toolbar" style="padding:12px 16px">
       <select id="st"><option value="active">กำลังดำเนินการ</option><option value="">ทั้งหมด</option>
         ${['open', 'picked', 'planned', 'shipped', 'delivered', 'failed', 'cancelled'].map(s => `<option value="${s}">${STATUS[s][0]}</option>`).join('')}</select>
       <input type="search" id="search" placeholder="ค้นหาเลขที่ / ลูกค้า"><span class="spacer"></span>
-      <button class="btn sm" data-act="pickAll">หยิบสินค้าทุกออเดอร์ที่รอ</button></div><div id="tbl"></div></div>`;
+      ${writable ? '<button class="btn sm" data-act="pickAll">หยิบสินค้าทุกออเดอร์ที่รอ</button>' : ''}</div><div id="tbl"></div></div>`;
 
     const load = async () => {
       rows = await q(sb.from('wt_outbound_orders')
@@ -369,7 +398,7 @@ Pages.outbound = {
     };
     const draw = () => {
       const st = $('#st', el).value, term = $('#search', el).value.trim().toLowerCase();
-      const list = rows.filter(r => (st === 'active' ? !['delivered', 'cancelled'].includes(r.status) : !st || r.status === st) &&
+      const list = shown = rows.filter(r => (st === 'active' ? !['delivered', 'cancelled'].includes(r.status) : !st || r.status === st) &&
         (!term || `${r.doc_no} ${r.ref_no} ${r.customer?.name}`.toLowerCase().includes(term)));
       $('#tbl', el).innerHTML = tableHtml([
         { label: 'เลขที่', render: r => `<b>${esc(r.doc_no)}</b>` }, { label: 'ลูกค้า', render: r => esc(r.customer?.name) },
@@ -379,7 +408,7 @@ Pages.outbound = {
         { label: 'น้ำหนัก (kg)', num: true, render: r => +r.total_weight_kg ? fmt(r.total_weight_kg) : '' },
         { label: 'สถานะ', render: r => badge(r.status) },
       ], list, {
-        actions: r => `${r.status === 'open' ? `<button class="btn sm primary" data-act="pick" data-id="${r.id}">หยิบสินค้า</button>` : ''}
+        actions: r => `${writable && r.status === 'open' ? `<button class="btn sm primary" data-act="pick" data-id="${r.id}">หยิบสินค้า</button>` : ''}
           <button class="btn sm" data-act="open" data-id="${r.id}">เปิด</button>`,
       });
     };
@@ -446,7 +475,7 @@ Pages.outbound = {
             { label: 'Location', render: p => `<b>${esc(p.from?.code)}</b>` }, { label: 'SKU', render: p => esc(p.product.sku) },
             { label: 'Lot', key: 'lot_no' }, { label: 'จำนวน', num: true, render: p => fmt(p.qty) },
           ], picks)}` : ''}`,
-        footer: `${h.status === 'open' ? `<button type="button" class="btn danger" data-act="cancel">ยกเลิกออเดอร์</button>
+        footer: `${writable && h.status === 'open' ? `<button type="button" class="btn danger" data-act="cancel">ยกเลิกออเดอร์</button>
             <button type="button" class="btn primary" data-act="pick">หยิบสินค้า</button>` : ''}
           <button type="button" class="btn" data-act="print">พิมพ์</button><span class="spacer"></span>`,
         onOpen: (body, foot) => bindActions(foot, {
@@ -460,8 +489,43 @@ Pages.outbound = {
         }),
       });
     };
+    // Excel rows: one row per product line; rows sharing ref_no + customer_code become one order
+    const importOrders = () => importDialog({
+      title: 'นำเข้าออเดอร์จาก Excel', templateName: 'template-outbound-orders',
+      columns: ['ref_no', 'customer_code', 'warehouse_code', 'required_date', 'priority', 'sku', 'qty', 'note'],
+      templateRows: [
+        { ref_no: 'SO-001', customer_code: 'CUS-01', warehouse_code: 'BKK1', required_date: today(), priority: 3, sku: 'SKU-1001', qty: 10, note: '' },
+        { ref_no: 'SO-001', customer_code: 'CUS-01', warehouse_code: 'BKK1', required_date: today(), priority: 3, sku: 'SKU-2001', qty: 5, note: '' },
+      ],
+      note: 'หนึ่งแถว = หนึ่งรายการสินค้า, แถวที่ ref_no + customer_code เหมือนกันจะรวมเป็นออเดอร์เดียว',
+      onRows: async raw => {
+        const groups = new Map(), errs = [];
+        raw.forEach((r, i) => {
+          const c = LK.partners.find(p => p.code === String(r.customer_code).trim());
+          const w = LK.warehouses.find(x => x.code === String(r.warehouse_code).trim());
+          const p = findProductByCode(String(r.sku).trim());
+          const qty = Number(String(r.qty).replace(/,/g, ''));
+          if (!c || !w || !p || !(qty > 0)) { errs.push(`แถว ${i + 2}: ${!c ? 'ไม่พบลูกค้า ' : ''}${!w ? 'ไม่พบคลัง ' : ''}${!p ? 'ไม่พบ SKU ' : ''}${!(qty > 0) ? 'จำนวนผิด' : ''}`); return; }
+          const key = `${r.ref_no}|${c.id}|${w.id}`;
+          if (!groups.has(key)) groups.set(key, { head: { customer_id: c.id, warehouse_id: w.id, ref_no: r.ref_no || null,
+            required_date: r.required_date || null, priority: Number(r.priority) || 3, note: r.note || null,
+            ship_address: c.address, lat: c.lat, lng: c.lng }, lines: [] });
+          groups.get(key).lines.push({ product_id: p.id, qty_ordered: qty });
+        });
+        if (errs.length) { toast(errs.slice(0, 3).join(' | '), 'err'); throw new Error('invalid'); }
+        const heads = await q(sb.from('wt_outbound_orders').insert([...groups.values()].map(g => g.head)).select('id'));
+        const lines = [...groups.values()].flatMap((g, i) => g.lines.map(l => ({ ...l, outbound_id: heads[i].id })));
+        const { error } = await sb.from('wt_outbound_lines').insert(lines);
+        if (error) { await sb.from('wt_outbound_orders').delete().in('id', heads.map(h => h.id)); toast(error.message, 'err'); throw error; }
+        toast(`นำเข้า ${heads.length} ออเดอร์ (${lines.length} รายการ)`, 'ok');
+        await load();
+      },
+    });
     const handlers = {
-      new: create, open: detail,
+      new: create, open: detail, import: importOrders,
+      export: () => exportXlsx(`outbound-${today()}`, shown.map(r => ({ doc_no: r.doc_no, ref_no: r.ref_no, customer: r.customer?.name,
+        warehouse: r.warehouse?.code, required_date: r.required_date, priority: r.priority, lines: r.lines.length,
+        weight_kg: +r.total_weight_kg, status: r.status }))),
       pick: async id => { await pick(id); await load(); },
       pickAll: async () => {
         const open = rows.filter(r => r.status === 'open').sort((a, b) => a.priority - b.priority || a.id - b.id);
@@ -488,6 +552,8 @@ Pages.products = {
   title: 'สินค้า', group: 'ข้อมูลหลัก', icon: '◫',
   render: crudPage({
     table: 'wt_products', noun: 'สินค้า', order: 'sku', searchKeys: ['sku', 'name', 'barcode', 'category'],
+    writeRoles: ['warehouse'], importKey: 'sku',
+    labels: r => ({ code: r.barcode || r.sku, title: r.sku, sub: r.name }),
     cols: [
       { label: 'SKU', render: r => `<b>${esc(r.sku)}</b>` }, { label: 'ชื่อสินค้า', key: 'name' }, { label: 'บาร์โค้ด', key: 'barcode' },
       { label: 'หมวด', key: 'category' }, { label: 'หน่วย', key: 'uom' },
@@ -508,6 +574,7 @@ Pages.warehouses = {
   title: 'คลังสินค้า', group: 'ข้อมูลหลัก', icon: '⌂',
   render: crudPage({
     table: 'wt_warehouses', noun: 'คลังสินค้า', order: 'code', searchKeys: ['code', 'name', 'address'],
+    writeRoles: ['warehouse'], importKey: 'code',
     cols: [
       { label: 'รหัส', render: r => `<b>${esc(r.code)}</b>` }, { label: 'ชื่อ', key: 'name' }, { label: 'ที่อยู่', key: 'address' },
       { label: 'พิกัด', render: r => r.lat != null ? `${r.lat}, ${r.lng}` : '' }, activeCol,
@@ -525,6 +592,14 @@ Pages.locations = {
   render: crudPage({
     table: 'wt_locations', noun: 'Location', select: '*, warehouse:wt_warehouses(code)', order: 'code',
     lookups: ['warehouses'], searchKeys: ['code', 'zone', 'loc_type'],
+    writeRoles: ['warehouse'], importKey: 'warehouse_id,code',
+    labels: r => ({ code: r.code, title: r.code, sub: `${r.warehouse?.code} · ${LOC_TYPES[r.loc_type]}${r.zone ? ' · โซน ' + r.zone : ''}` }),
+    exportMap: ({ warehouse_id, ...rest }, r) => ({ warehouse_code: r.warehouse?.code, ...rest }),
+    importMap: ({ warehouse_code, ...rest }) => {
+      const w = LK.warehouses.find(x => x.code === warehouse_code);
+      if (!w) { toast(`ไม่พบคลัง ${warehouse_code}`, 'err'); throw new Error('bad warehouse'); }
+      return { ...rest, warehouse_id: w.id };
+    },
     cols: [
       { label: 'คลัง', render: r => esc(r.warehouse?.code) }, { label: 'Location', render: r => `<b>${esc(r.code)}</b>` },
       { label: 'โซน', key: 'zone' }, { label: 'ประเภท', render: r => esc(LOC_TYPES[r.loc_type]) },
@@ -544,6 +619,7 @@ Pages.partners = {
   title: 'ลูกค้า / ผู้ขาย', group: 'ข้อมูลหลัก', icon: '☺',
   render: crudPage({
     table: 'wt_partners', noun: 'คู่ค้า', order: 'code', searchKeys: ['code', 'name', 'phone', 'address'],
+    writeRoles: ['warehouse', 'transport'], importKey: 'code',
     cols: [
       { label: 'รหัส', render: r => `<b>${esc(r.code)}</b>` }, { label: 'ชื่อ', key: 'name' },
       { label: 'ประเภท', render: r => badge(r.partner_type) }, { label: 'ผู้ติดต่อ', key: 'contact' }, { label: 'โทร', key: 'phone' },

@@ -40,7 +40,7 @@ Pages.planning = {
         </div>
         <div id="cap"></div>
         <div class="row"><button class="btn" id="suggest">แนะนำรถที่เหมาะสม</button><span class="spacer"></span>
-          <span class="muted small" id="cost"></span><button class="btn primary" id="create">สร้างเที่ยวรถ</button></div>
+          <span class="muted small" id="cost"></span><button class="btn primary" id="create" ${can('transport') ? '' : 'disabled title="เฉพาะฝ่ายขนส่ง"'}>สร้างเที่ยวรถ</button></div>
         <div id="seq" class="small"></div>
       </div></div>
       <div class="card"><h3>เส้นทาง (จัดลำดับอัตโนมัติแบบ Nearest-neighbour)</h3><div id="map" class="map"></div></div>`;
@@ -124,6 +124,16 @@ async function shipmentDetail(id, onChange) {
     q(sb.from('wt_tracking_events').select('*').eq('shipment_id', id).order('created_at')),
   ]);
   const w = s.warehouse;
+  const manage = can('transport');
+  // POD photos/signatures live in a private bucket -> short-lived signed URLs
+  const paths = stops.flatMap(r => [r.pod_photo, r.pod_signature]).filter(Boolean);
+  const signed = {};
+  if (paths.length) {
+    const { data } = await sb.storage.from('wt-pod').createSignedUrls(paths, 3600);
+    (data || []).forEach(d => { if (d.signedUrl) signed[d.path] = d.signedUrl; });
+  }
+  const podImgs = r => [r.pod_photo, r.pod_signature].filter(p => signed[p])
+    .map(p => `<a href="${esc(signed[p])}" target="_blank" rel="noopener"><img src="${esc(signed[p])}" alt="POD" style="height:48px;border-radius:4px;border:1px solid var(--border);background:#fff"></a>`).join(' ');
   openModal({
     title: `เที่ยวรถ ${s.doc_no}`, wide: true,
     body: `<div class="info-grid">
@@ -141,17 +151,17 @@ async function shipmentDetail(id, onChange) {
         { label: 'kg', num: true, render: r => fmt(r.order.total_weight_kg) },
         { label: 'สถานะ', render: r => badge(r.status) },
         { label: 'POD', render: r => r.status === 'pending'
-          ? (s.status === 'in_transit' ? `<div class="row" data-stop="${r.id}" style="flex-wrap:nowrap">
+          ? (manage && s.status === 'in_transit' ? `<div class="row" data-stop="${r.id}" style="flex-wrap:nowrap">
               <input placeholder="ชื่อผู้รับ / เหตุผล" style="width:160px">
               <button type="button" class="btn sm ok" data-act="ok" data-id="${r.id}">ส่งสำเร็จ</button>
               <button type="button" class="btn sm danger" data-act="fail" data-id="${r.id}">ไม่สำเร็จ</button></div>` : '')
-          : `${esc(r.pod_name || '')} <span class="muted small">${fdt(r.delivered_at)} ${esc(r.pod_note || '')}</span>` },
+          : `${esc(r.pod_name || '')} <span class="muted small">${fdt(r.delivered_at)} ${esc(r.pod_note || '')}</span> ${podImgs(r)}` },
       ], stops)}
       <div id="ship-map" class="map sm"></div>
       ${events.length ? `<h3>Timeline</h3><ul class="timeline">${events.map(e => `<li><div>${badge(e.event)} <span class="muted small">${fdt(e.created_at)}</span><br>${esc(e.note || '')}</div></li>`).join('')}</ul>` : ''}`,
-    footer: `${s.status === 'planned' ? `<button type="button" class="btn danger" data-act="cancel">ยกเลิกเที่ยว</button>
+    footer: `${manage && s.status === 'planned' ? `<button type="button" class="btn danger" data-act="cancel">ยกเลิกเที่ยว</button>
         <button type="button" class="btn primary" data-act="dispatch">ปล่อยรถ</button>` : ''}
-      ${s.status === 'in_transit' ? `<button type="button" class="btn" data-act="gps">บันทึกตำแหน่ง GPS</button>` : ''}
+      ${manage && s.status === 'in_transit' ? `<button type="button" class="btn" data-act="gps">บันทึกตำแหน่ง GPS</button>` : ''}
       <button type="button" class="btn" data-act="print">พิมพ์ใบคุมรถ</button><span class="spacer"></span>`,
     onOpen: (body, foot) => {
       makeMap($('#ship-map', body), [
@@ -192,6 +202,11 @@ Pages.shipments = {
   title: 'เที่ยวรถ / จัดส่ง', group: 'TMS ขนส่ง', icon: '⛟',
   render: async (el, actions, params) => {
     let rows = [];
+    actions.innerHTML = '<button class="btn" data-act="export">⇩ Excel</button>';
+    bindActions(actions, { export: () => exportXlsx(`shipments-${today()}`, rows.map(r => ({ doc_no: r.doc_no, plan_date: r.plan_date,
+      warehouse: r.warehouse?.code, vehicle: r.vehicle?.plate_no, driver: r.driver?.name, stops: r.stops.length,
+      delivered: r.stops.filter(x => x.status === 'delivered').length, weight_kg: +r.total_weight_kg, km: +r.distance_km,
+      freight_cost: +r.freight_cost, status: r.status }))) });
     el.innerHTML = `<div class="card flush"><div class="toolbar" style="padding:12px 16px">
       <select id="st"><option value="active">กำลังดำเนินการ</option><option value="">ทั้งหมด</option>
       ${['planned', 'in_transit', 'completed', 'cancelled'].map(s => `<option value="${s}">${STATUS[s][0]}</option>`).join('')}</select>
@@ -257,7 +272,16 @@ Pages.tracking = {
 /* ================= REPORTS ================= */
 Pages.reports = {
   title: 'รายงานขนส่ง', group: 'TMS ขนส่ง', icon: '▤',
-  render: async el => {
+  render: async (el, actions) => {
+    let byVehicle = [], byDriver = [];
+    actions.innerHTML = '<button class="btn" data-act="export">⇩ Excel</button>';
+    bindActions(actions, { export: async () => {
+      await loadLib('xlsx');
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(byVehicle), 'by-vehicle');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(byDriver), 'by-driver');
+      XLSX.writeFile(wb, `transport-report-${$('#from', el).value}_${$('#to', el).value}.xlsx`);
+    } });
     const d = new Date(), first = new Date(d.getFullYear(), d.getMonth(), 1).toISOString().slice(0, 10);
     el.innerHTML = `<div class="card"><div class="toolbar"><label>ตั้งแต่<input type="date" id="from" value="${first}"></label>
       <label>ถึง<input type="date" id="to" value="${today()}"></label></div></div><div id="out" style="display:grid;gap:18px"></div>`;
@@ -281,14 +305,16 @@ Pages.reports = {
         { label: 'สำเร็จ', num: true, render: g => pct(g.ok, g.drops) }, { label: 'น้ำหนัก (kg)', num: true, render: g => fmt(g.kg, 0) },
         { label: 'km', num: true, render: g => fmt(g.km, 0) }, { label: 'ค่าขนส่ง', num: true, render: g => fmt(g.cost) },
       ];
+      byVehicle = group(s => s.vehicle?.plate_no || '-');
+      byDriver = group(s => s.driver?.name || '-');
       const kpi = (l, v) => `<div class="kpi"><div class="label">${l}</div><div class="value">${v}</div></div>`;
       $('#out', el).innerHTML = `<div class="kpis">
           ${kpi('เที่ยวรถ', fmt(ships.length, 0))}${kpi('จุดส่งทั้งหมด', fmt(stops.length, 0))}
           ${kpi('ส่งสำเร็จ', pct(ok.length, done.length))}${kpi('ส่งตรงเวลา (OTD)', pct(onTime.length, ok.length))}
           ${kpi('ระยะทางรวม (km)', fmt(km, 0))}${kpi('ค่าขนส่งรวม (฿)', fmt(cost, 0))}
           ${kpi('ต้นทุน/จุดส่ง (฿)', stops.length ? fmt(cost / stops.length, 0) : '-')}${kpi('ต้นทุน/km (฿)', km ? fmt(cost / km) : '-')}</div>
-        <div class="grid-2"><div class="card flush"><h3>ตามรถ</h3>${tableHtml(gcols('ทะเบียนรถ'), group(s => s.vehicle?.plate_no || '-'))}</div>
-        <div class="card flush"><h3>ตามพนักงานขับรถ</h3>${tableHtml(gcols('พนักงานขับรถ'), group(s => s.driver?.name || '-'))}</div></div>`;
+        <div class="grid-2"><div class="card flush"><h3>ตามรถ</h3>${tableHtml(gcols('ทะเบียนรถ'), byVehicle)}</div>
+        <div class="card flush"><h3>ตามพนักงานขับรถ</h3>${tableHtml(gcols('พนักงานขับรถ'), byDriver)}</div></div>`;
     };
     $('#from', el).onchange = run;
     $('#to', el).onchange = run;
@@ -301,6 +327,7 @@ Pages.vehicles = {
   title: 'รถขนส่ง', group: 'TMS ขนส่ง', icon: '⛍',
   render: crudPage({
     table: 'wt_vehicles', noun: 'รถ', order: 'plate_no', searchKeys: ['plate_no', 'vehicle_type', 'carrier_name'],
+    writeRoles: ['transport'], importKey: 'plate_no',
     cols: [
       { label: 'ทะเบียน', render: r => `<b>${esc(r.plate_no)}</b>` }, { label: 'ประเภท', key: 'vehicle_type' },
       { label: 'ความจุ (kg)', num: true, render: r => fmt(r.capacity_kg, 0) }, { label: 'ความจุ (cbm)', num: true, render: r => fmt(r.capacity_cbm) },
@@ -318,6 +345,11 @@ Pages.vehicles = {
         options: opts({ available: 'ว่าง', on_trip: 'ออกวิ่ง', maintenance: 'ซ่อมบำรุง', inactive: 'ไม่ใช้งาน' }) },
       { name: 'ownership', label: 'กรรมสิทธิ์', type: 'select', required: true, default: 'own', options: opts({ own: 'รถบริษัท', subcontract: 'รถร่วม' }) },
       { name: 'carrier_name', label: 'ชื่อผู้รับจ้างขนส่ง (รถร่วม)' },
+      { name: 'odometer_km', label: 'เลขไมล์ปัจจุบัน (km)', type: 'number', default: 0 },
+      { name: 'next_service_km', label: 'เข้าศูนย์ครั้งถัดไปที่ (km)', type: 'number' },
+      { name: 'next_service_date', label: 'เข้าศูนย์ครั้งถัดไป (วันที่)', type: 'date' },
+      { name: 'tax_expiry', label: 'ภาษีรถหมดอายุ', type: 'date' },
+      { name: 'insurance_expiry', label: 'ประกันหมดอายุ', type: 'date' },
     ],
   }),
 };
@@ -326,6 +358,7 @@ Pages.drivers = {
   title: 'พนักงานขับรถ', group: 'TMS ขนส่ง', icon: '☻',
   render: crudPage({
     table: 'wt_drivers', noun: 'พนักงานขับรถ', order: 'code', searchKeys: ['code', 'name', 'phone', 'license_no'],
+    writeRoles: ['transport'], importKey: 'code',
     cols: [
       { label: 'รหัส', render: r => `<b>${esc(r.code)}</b>` }, { label: 'ชื่อ', key: 'name' }, { label: 'โทร', key: 'phone' },
       { label: 'ใบขับขี่', key: 'license_no' }, { label: 'หมดอายุ', render: r => expiryBadge(r.license_expiry) },

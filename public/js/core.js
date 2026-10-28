@@ -167,26 +167,38 @@ const optPartners = (...types) => LK.partners.filter(p => p.active && types.incl
 const optionTags = (list, sel) => list.map(o => `<option value="${esc(o.value)}" ${String(o.value) === String(sel) ? 'selected' : ''}>${esc(o.label)}</option>`).join('');
 
 /* ---------- Generic CRUD page ---------- */
-function crudPage({ table, noun, select = '*', order = 'id', cols, fields, searchKeys = [], lookups = [], ascending = true }) {
+// importKey: unique column(s) used for Excel upsert; importMap: row => row (resolve codes to ids)
+// labels: row => {code, title, sub} enables barcode label printing
+function crudPage({ table, noun, select = '*', order = 'id', cols, fields, searchKeys = [], lookups = [], ascending = true,
+  writeRoles = [], importKey, importMap, labels, exportMap }) {
   return async (el, actions) => {
     await loadLookups(...lookups);
     const fieldList = () => (typeof fields === 'function' ? fields() : fields);
-    let rows = [];
+    const writable = can(...writeRoles);
+    let rows = [], list = [];
     const load = async () => { rows = await q(sb.from(table).select(select).order(order, { ascending })); draw(); };
 
-    actions.innerHTML = `<button class="btn primary" data-act="add">+ เพิ่ม${esc(noun)}</button>`;
+    actions.innerHTML = `<button class="btn" data-act="export">⇩ Excel</button>
+      ${writable && importKey ? `<button class="btn" data-act="import">⇧ นำเข้า Excel</button>` : ''}
+      ${labels ? `<button class="btn" data-act="labels">▥ พิมพ์ป้ายบาร์โค้ด</button>` : ''}
+      ${writable ? `<button class="btn primary" data-act="add">+ เพิ่ม${esc(noun)}</button>` : ''}`;
     el.innerHTML = `<div class="card flush">
       <div class="toolbar" style="padding:12px 16px"><input type="search" placeholder="ค้นหา..." id="search"><span class="muted small" id="count"></span></div>
       <div id="tbl"></div></div>`;
     const draw = () => {
       const term = $('#search', el).value.trim().toLowerCase();
-      const list = term ? rows.filter(r => searchKeys.some(k => String(r[k] ?? '').toLowerCase().includes(term))) : rows;
+      list = term ? rows.filter(r => searchKeys.some(k => String(r[k] ?? '').toLowerCase().includes(term))) : rows;
       $('#count', el).textContent = `${list.length} รายการ`;
       $('#tbl', el).innerHTML = tableHtml(cols, list, {
-        actions: r => `<button class="btn sm" data-act="edit" data-id="${r.id}">แก้ไข</button>
-                       <button class="btn sm danger" data-act="del" data-id="${r.id}">ลบ</button>`,
+        actions: writable ? r => `<button class="btn sm" data-act="edit" data-id="${r.id}">แก้ไข</button>
+                       <button class="btn sm danger" data-act="del" data-id="${r.id}">ลบ</button>` : null,
       });
     };
+    const exportRows = () => list.map(r => {
+      const o = {};
+      for (const f of fieldList()) o[f.name] = r[f.name];
+      return exportMap ? exportMap(o, r) : o;
+    });
     $('#search', el).addEventListener('input', draw);
 
     const edit = row => openModal({
@@ -209,12 +221,169 @@ function crudPage({ table, noun, select = '*', order = 'id', cols, fields, searc
         if (error) toast(error.code === '23503' ? 'ลบไม่ได้: ข้อมูลนี้ถูกใช้งานอยู่ (ตั้งเป็นไม่ใช้งานแทน)' : error.message, 'err');
         else { toast('ลบแล้ว', 'ok'); await load(); }
       },
+      export: () => exportXlsx(`${table.replace('wt_', '')}-${today()}`, exportRows()),
+      labels: () => printLabels(list.map(labels)),
+      import: () => importDialog({
+        title: `นำเข้า${noun}จาก Excel`,
+        templateName: `template-${table.replace('wt_', '')}`,
+        templateRows: exportRows().slice(0, 3),
+        columns: Object.keys(exportRows()[0] || Object.fromEntries(fieldList().map(f => [f.name, '']))),
+        note: `ถ้า ${importKey} ซ้ำกับที่มีอยู่ ระบบจะอัปเดตข้อมูลเดิม`,
+        onRows: async raw => {
+          const data = raw.map(r => coerceRow(r, fieldList())).map(r => (importMap ? importMap(r) : r));
+          await q(sb.from(table).upsert(data, { onConflict: importKey }));
+          toast(`นำเข้า ${data.length} รายการแล้ว`, 'ok');
+          await load();
+        },
+      }),
     };
     bindActions(el, handlers);
     bindActions(actions, handlers);
     await load();
   };
 }
+
+/* ---------- Roles ---------- */
+let ME = null; // wt_profiles row of the signed-in user
+const ROLE_TH = { admin: 'ผู้ดูแลระบบ', warehouse: 'พนักงานคลัง', transport: 'ฝ่ายขนส่ง', driver: 'พนักงานขับรถ', viewer: 'ดูอย่างเดียว', pending: 'รออนุมัติ' };
+// admin can do everything; with no roles given, any signed-in role passes
+const can = (...roles) => !!ME && (ME.role === 'admin' || !roles.length || roles.includes(ME.role));
+
+/* ---------- Lazy third-party scripts ---------- */
+const LIBS = {
+  xlsx: 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+  qr: 'https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js',
+  barcode: 'https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.6/JsBarcode.all.min.js',
+};
+const loaded = {};
+function loadLib(name) {
+  return loaded[name] ??= new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = LIBS[name]; s.onload = resolve;
+    s.onerror = () => { delete loaded[name]; reject(new Error('โหลดไลบรารีไม่สำเร็จ: ' + name)); };
+    document.head.append(s);
+  });
+}
+
+/* ---------- Excel ---------- */
+async function exportXlsx(name, rows, sheet = 'data') {
+  if (!rows.length) return toast('ไม่มีข้อมูลให้ export', 'err');
+  await loadLib('xlsx');
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), sheet);
+  XLSX.writeFile(wb, `${name}.xlsx`);
+}
+async function readXlsx(file) {
+  await loadLib('xlsx');
+  const wb = XLSX.read(await file.arrayBuffer(), { cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(ws, { raw: false, dateNF: 'yyyy-mm-dd', defval: '' });
+}
+// Convert spreadsheet strings to the types the form fields expect
+function coerceRow(r, fields) {
+  const out = {};
+  for (const [k, v0] of Object.entries(r)) {
+    const v = typeof v0 === 'string' ? v0.trim() : v0;
+    const f = fields.find(x => x.name === k);
+    if (v === '' || v == null) out[k] = f?.type === 'checkbox' ? true : null;
+    else if (f?.type === 'number' || f?.numeric) out[k] = Number(String(v).replace(/,/g, ''));
+    else if (f?.type === 'checkbox') out[k] = !/^(false|0|no|n|ไม่)$/i.test(String(v));
+    else out[k] = String(v);
+  }
+  return out;
+}
+function importDialog({ title, templateName, templateRows, columns, note, onRows }) {
+  openModal({
+    title, submitText: 'นำเข้า',
+    body: `<p class="small muted">คอลัมน์ที่ใช้ (แถวแรกของไฟล์): <code>${columns.map(esc).join(', ')}</code><br>${esc(note || '')}</p>
+      <button type="button" class="btn sm" data-act="tpl">⇩ ดาวน์โหลดไฟล์ตัวอย่าง</button>
+      <label>ไฟล์ Excel / CSV<input type="file" name="file" accept=".xlsx,.xls,.csv" required></label>
+      <div id="preview" class="small"></div>`,
+    onOpen: body => {
+      bindActions(body, {
+        tpl: () => exportXlsx(templateName, templateRows.length ? templateRows : [Object.fromEntries(columns.map(c => [c, '']))]),
+      });
+      body.querySelector('[name=file]').onchange = async e => {
+        const rows = await readXlsx(e.target.files[0]);
+        $('#preview', body).innerHTML = `พบ ${rows.length} แถว` + tableHtml(Object.keys(rows[0] || {}).map(k => ({ label: k, key: k })), rows.slice(0, 5));
+      };
+    },
+    onSubmit: async form => {
+      const rows = (await readXlsx(form.elements.file.files[0])).filter(r => Object.values(r).some(v => String(v).trim() !== ''));
+      if (!rows.length) { toast('ไฟล์ไม่มีข้อมูล', 'err'); return false; }
+      try { await onRows(rows); } catch (e) { return false; }
+    },
+  });
+}
+
+/* ---------- Barcode labels ---------- */
+async function printLabels(items) {
+  if (!items.length) return toast('ไม่มีรายการ', 'err');
+  await loadLib('barcode');
+  const holder = document.createElement('div');
+  const html = items.map(it => {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    holder.append(svg);
+    JsBarcode(svg, it.code, { format: 'CODE128', height: 48, fontSize: 14, margin: 4 });
+    return `<div class="lbl"><b>${esc(it.title)}</b><span>${esc(it.sub || '')}</span>${svg.outerHTML}</div>`;
+  }).join('');
+  const w = window.open('', '_blank');
+  if (!w) return toast('เบราว์เซอร์บล็อกหน้าต่างใหม่ กรุณาอนุญาต pop-up', 'err');
+  w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Labels</title><style>
+    body{font-family:sans-serif;margin:8px;display:grid;grid-template-columns:repeat(auto-fill,62mm);gap:4mm}
+    .lbl{border:1px dashed #999;padding:3mm;display:grid;justify-items:center;font-size:12px;break-inside:avoid}
+    .lbl b{font-size:13px}.lbl svg{max-width:100%}</style></head><body>${html}
+    <script>onload=()=>print()<\/script></body></html>`);
+  w.document.close();
+}
+
+/* ---------- Barcode / QR scanning (camera, with manual fallback) ---------- */
+async function scanCode(title = 'สแกนบาร์โค้ด') {
+  const dlg = $('#scan-dialog');
+  $('#scan-title').textContent = title;
+  $('#scan-manual').value = '';
+  $('#scan-msg').textContent = 'กำลังเปิดกล้อง...';
+  dlg.showModal();
+  let scanner = null;
+  const result = new Promise(resolve => {
+    const done = v => { resolve(v); if (dlg.open) dlg.close(); };
+    $('#scan-form').onsubmit = e => { e.preventDefault(); done($('#scan-manual').value.trim() || null); };
+    dlg.onclose = () => done(null);
+    loadLib('qr').then(() => {
+      if (!dlg.open) return;
+      scanner = new Html5Qrcode('scan-reader');
+      return scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 260, height: 160 } },
+        text => { if (navigator.vibrate) navigator.vibrate(80); done(text); }, () => {})
+        .then(() => { $('#scan-msg').textContent = 'เล็งกล้องไปที่บาร์โค้ด หรือพิมพ์/ใช้เครื่องสแกน USB ด้านล่าง'; });
+    }).catch(err => { $('#scan-msg').textContent = `เปิดกล้องไม่ได้ (${err?.message || err}) — พิมพ์รหัสด้านล่างแทน`; });
+    setTimeout(() => $('#scan-manual').focus(), 100);
+  });
+  const code = await result;
+  if (scanner) { try { if (scanner.isScanning) await scanner.stop(); scanner.clear(); } catch { /* already stopped */ } }
+  return code;
+}
+const findProductByCode = c => LK.products?.find(p => p.barcode === c || p.sku.toLowerCase() === c.toLowerCase());
+const findLocationByCode = (c, whId) => LK.locations?.find(l => l.code.toLowerCase() === c.toLowerCase() && (!whId || l.warehouse_id === Number(whId)));
+const scanBtn = (kind = '') => `<button type="button" class="btn sm" data-scan="${kind}" title="สแกนบาร์โค้ด">▥</button>`;
+
+// Any [data-scan] button fills the input/select right before it.
+document.addEventListener('click', async e => {
+  const btn = e.target.closest('[data-scan]');
+  if (!btn) return;
+  e.preventDefault();
+  const target = btn.previousElementSibling;
+  const code = await scanCode();
+  if (!code || !target) return;
+  if (target.tagName === 'SELECT') {
+    const kind = btn.dataset.scan;
+    const hit = kind === 'location' ? findLocationByCode(code) : findProductByCode(code);
+    const opt = hit && [...target.options].find(o => Number(o.value) === hit.id);
+    if (!opt) return toast(`ไม่พบรหัส ${code} ในรายการ`, 'err');
+    target.value = opt.value;
+  } else target.value = code;
+  target.dispatchEvent(new Event('input', { bubbles: true }));
+  target.dispatchEvent(new Event('change', { bubbles: true }));
+});
 
 /* ---------- Geo ---------- */
 function haversineKm(a, b) {
