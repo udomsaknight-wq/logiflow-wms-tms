@@ -174,7 +174,7 @@ async function enterApp() {
   startRealtime();
 }
 
-let sessionUser = null;
+let sessionUser;   // undefined until the first auth event, so a signed-out start still shows the login
 sb.auth.onAuthStateChange((_event, session) => {
   const uid = session?.user?.id || null;
   if (uid === sessionUser) return;   // token refresh etc.
