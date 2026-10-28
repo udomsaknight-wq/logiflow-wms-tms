@@ -1,0 +1,10 @@
+services:
+  - type: web
+    runtime: static
+    name: logiflow-wms-tms
+    buildCommand: echo "static site - no build"
+    staticPublishPath: ./public
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: SAMEORIGIN
